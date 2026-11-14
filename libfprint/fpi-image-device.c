@@ -42,6 +42,14 @@
  */
 #define SIGFM_ENROLL_DUPLICATE_INLIERS 16
 
+/* Usable presses on this sensor produced 66-256 keypoints, while a frame
+ * captured without a proper finger produced 10. A partial press leaves large
+ * flat areas with no ridge detail; every validated press covered at least 62%
+ * of the active area, so these cutoffs sit below the observed range.
+ */
+#define SIGFM_MIN_KEYPOINTS 30
+#define SIGFM_MIN_COVERAGE 0.55
+
 /**
  * SECTION: fpi-image-device
  * @title: Internal FpImageDevice
@@ -502,6 +510,42 @@ fpi_image_device_report_finger_status (FpImageDevice *self,
  * including e.g. an enroll operation which captures multiple images during
  * one session.
  */
+/* Fraction of the active sensor area that carries ridge-like detail. Pressed
+ * tiles have a grey-level standard deviation far above the flat areas left by a
+ * finger that only touches an edge, so a low value means the press is partial.
+ */
+static gdouble
+sigfm_image_coverage (const guchar *data, gint width, gint height)
+{
+  const gint tile = 8;
+  const gdouble min_std = 25.0;
+  gint active = 0;
+  gint total = 0;
+
+  for (gint ty = 2; ty + tile <= height - 2; ty += tile)
+    for (gint tx = 2; tx + tile <= width - 2; tx += tile)
+      {
+        gdouble sum = 0.0;
+        gdouble sum_sq = 0.0;
+        const gdouble n = tile * tile;
+
+        for (gint y = ty; y < ty + tile; y++)
+          for (gint x = tx; x < tx + tile; x++)
+            {
+              const gdouble v = data[y * width + x];
+              sum += v;
+              sum_sq += v * v;
+            }
+
+        total++;
+
+        if (sum_sq / n - (sum / n) * (sum / n) >= min_std * min_std)
+          active++;
+      }
+
+  return total > 0 ? (gdouble) active / total : 0.0;
+}
+
 /* Reject a press that is nearly identical to an already stored enrollment
  * stage: it would only duplicate existing coverage. The threshold is well above
  * what any wrong finger scored, so only repeated placements are discarded.
@@ -568,15 +612,18 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
 
   SigfmImgInfo *info = sigfm_extract (img_data, width, height);
   int kpts = sigfm_keypoints_count (info);
-  g_message ("SIGFM: extracted %d keypoints from %dx%d image", kpts, width, height);
+  const gdouble coverage = sigfm_image_coverage (img_data, width, height);
+  g_message ("SIGFM: extracted %d keypoints from %dx%d image (ridge coverage %.2f)",
+             kpts, width, height, coverage);
 
-  if (kpts < 6)
+  if (kpts < SIGFM_MIN_KEYPOINTS)
     {
-      g_warning ("SIGFM: too few keypoints (%d < 6), requesting retry", kpts);
+      g_warning ("SIGFM: too few keypoints (%d < %d), requesting retry",
+                 kpts, SIGFM_MIN_KEYPOINTS);
       if (info)
         sigfm_free_info (info);
       info = NULL;
-      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER, "Please center finger on sensor");
+      error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER, "Please place your finger over the sensor");
     }
 
   if (action == FPI_DEVICE_ACTION_ENROLL)
@@ -586,6 +633,14 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
 
       if (!priv->enroll_features)
         priv->enroll_features = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+
+      if (!error && info && coverage < SIGFM_MIN_COVERAGE)
+        {
+          g_warning ("SIGFM enroll: ridge coverage %.2f is below %.2f; requesting a new placement",
+                     coverage, SIGFM_MIN_COVERAGE);
+          error = fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                            "Center your finger on the sensor");
+        }
 
       if (!error && info && priv->enroll_features->len > 0)
         {
@@ -707,7 +762,18 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
                   matched_stages >= SIGFM_MIN_STAGES)
                 result = FPI_MATCH_SUCCESS;
               else
-                result = FPI_MATCH_FAIL;
+                {
+                  result = FPI_MATCH_FAIL;
+
+                  /* A failed match on a partial press says more about the
+                   * capture than about the finger, so ask for a better press
+                   * instead of reporting a mismatch.
+                   */
+                  if (coverage < SIGFM_MIN_COVERAGE)
+                    error = fpi_device_retry_new_msg (
+                      FP_DEVICE_RETRY_CENTER_FINGER,
+                      "Center your finger on the sensor");
+                }
 
               g_message ("SIGFM verify: stages=%d, max_inliers=%d, "
                          "matched_stages=%d -> %s",
