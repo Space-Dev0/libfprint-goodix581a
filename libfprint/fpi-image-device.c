@@ -25,6 +25,17 @@
 #include "fpi-print.h"
 #include "sigfm/sigfm.hpp"
 
+/* SIGFM scores a stage by the number of matches that agree on one rotation,
+ * scale and translation. A stage needs eight such inliers to count towards
+ * consensus. Verification succeeds with one strongly supported stage or three
+ * corroborating stages. On labelled 581a captures genuine presses scored
+ * 15-28, while wrong fingers never exceeded five; these cutoffs therefore
+ * leave a wide margin without accepting a single chance cluster.
+ */
+#define SIGFM_STAGE_MIN_INLIERS 8
+#define SIGFM_STRONG_INLIERS 12
+#define SIGFM_MIN_STAGES 3
+
 /**
  * SECTION: fpi-image-device
  * @title: Internal FpImageDevice
@@ -598,6 +609,7 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
             {
               int max_score = 0;
               int matched_stages = 0;
+              int stage = 0;
               GVariantIter iter;
               GVariant *stage_bytes;
 
@@ -606,15 +618,19 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
                 {
                   gsize sz;
                   const uint8_t *b = (const uint8_t *) g_variant_get_fixed_array (stage_bytes, &sz, 1);
+                  stage++;
                   if (b && sz > 0)
                     {
                       SigfmImgInfo *gallery_info = sigfm_deserialize_binary (b, (int) sz);
                       if (gallery_info)
                         {
-                          int score = sigfm_match_score (info, gallery_info);
+                          g_autofree gchar *stage_label =
+                            g_strdup_printf ("verify stage %d", stage);
+                          int score = sigfm_match_score (info, gallery_info,
+                                                         stage_label);
                           if (score > max_score)
                             max_score = score;
-                          if (score >= 40)
+                          if (score >= SIGFM_STAGE_MIN_INLIERS)
                             matched_stages++;
                           sigfm_free_info (gallery_info);
                         }
@@ -622,13 +638,16 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
                   g_variant_unref (stage_bytes);
                 }
 
-              if (max_score >= 70 || (max_score >= 45 && matched_stages >= 2))
+              if (max_score >= SIGFM_STRONG_INLIERS ||
+                  matched_stages >= SIGFM_MIN_STAGES)
                 result = FPI_MATCH_SUCCESS;
               else
                 result = FPI_MATCH_FAIL;
 
-              g_message ("SIGFM verify: max_score = %d, matched_stages = %d -> %s",
-                         max_score, matched_stages, result == FPI_MATCH_SUCCESS ? "MATCH" : "NO_MATCH");
+              g_message ("SIGFM verify: stages=%d, max_inliers=%d, "
+                         "matched_stages=%d -> %s",
+                         stage, max_score, matched_stages,
+                         result == FPI_MATCH_SUCCESS ? "MATCH" : "NO_MATCH");
             }
         }
       else
@@ -666,6 +685,7 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
 
               int max_score = 0;
               int matched_stages = 0;
+              int stage = 0;
               GVariantIter iter;
               GVariant *stage_bytes;
 
@@ -674,15 +694,19 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
                 {
                   gsize sz;
                   const uint8_t *b = (const uint8_t *) g_variant_get_fixed_array (stage_bytes, &sz, 1);
+                  stage++;
                   if (b && sz > 0)
                     {
                       SigfmImgInfo *gallery_info = sigfm_deserialize_binary (b, (int) sz);
                       if (gallery_info)
                         {
-                          int score = sigfm_match_score (info, gallery_info);
+                          g_autofree gchar *stage_label =
+                            g_strdup_printf ("identify stage %d", stage);
+                          int score = sigfm_match_score (info, gallery_info,
+                                                         stage_label);
                           if (score > max_score)
                             max_score = score;
-                          if (score >= 40)
+                          if (score >= SIGFM_STAGE_MIN_INLIERS)
                             matched_stages++;
                           sigfm_free_info (gallery_info);
                         }
@@ -690,7 +714,8 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
                   g_variant_unref (stage_bytes);
                 }
 
-              if (max_score >= 70 || (max_score >= 45 && matched_stages >= 2))
+              if (max_score >= SIGFM_STRONG_INLIERS ||
+                  matched_stages >= SIGFM_MIN_STAGES)
                 {
                   matched_template = tmpl;
                   break;

@@ -54,9 +54,12 @@ void sigfm_free_info(SigfmImgInfo* info);
  *
  * @param frame Print to be checked
  * @param enrolled Canonical print to verify against
- * @return int Non-negative match score; zero means reject or matching failed.
+ * @param context Short label used in diagnostics (may be NULL)
+ * @return int Number of matches agreeing on one similarity transform, or zero
+ *             when the stage is rejected or matching failed.
  */
-int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled);
+int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled,
+                      const char* context);
 
 /**
  * @brief Serialize an image info for storage

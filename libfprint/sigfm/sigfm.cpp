@@ -110,10 +110,31 @@ struct deserializer<SigfmImgInfo> : public std::true_type {
 } // namespace bin
 
 namespace {
-constexpr auto distance_match = 0.75;
-constexpr auto length_match = 0.12;
+/* The 80x64 581a captures produce few distinctive SIFT descriptors across
+ * separate presses. Keep more Lowe-ratio candidates here; the reciprocal,
+ * scale, rotation and translation checks below still reject outliers.
+ */
+constexpr auto distance_match = 0.90;
+/* Pairwise vectors must share the press-wide scale. The tolerance allows a
+ * consistent pressure-related change in apparent finger size but rejects
+ * local distortions that do not fit one global transform.
+ */
+constexpr auto length_match = 0.20;
+constexpr auto min_pair_scale = 0.70;
+constexpr auto max_pair_scale = 1.43;
 constexpr auto angle_match = 0.12;
-constexpr auto min_match = 4;
+/* After removing rotation and scale, genuine correspondences share a
+ * translation. Four pixels is roughly one ridge pitch on this sensor.
+ */
+constexpr auto translation_match = 4.0;
+constexpr auto min_match = 8;
+/* A stage only counts when at least eight reciprocal matches agree on one
+ * similarity transform and those inliers are at least 20% of all matches.
+ * On labelled 581a captures genuine presses put 15-28 matches on the common
+ * transform; wrong fingers never exceeded five.
+ */
+constexpr auto min_translation_inliers = 8;
+constexpr auto min_translation_ratio = 0.20;
 constexpr auto sift_nfeatures = 0;
 constexpr auto sift_octave_layers = 3;
 constexpr auto sift_contrast_threshold = 0.04;
@@ -133,10 +154,6 @@ struct match {
         return std::tie(this->p1.y, this->p1.x, this->p2.y, this->p2.x) <
                std::tie(right.p1.y, right.p1.x, right.p2.y, right.p2.x);
     }
-};
-struct angle {
-    double radians;
-    angle(double radians_) : radians{radians_} {}
 };
 } // namespace
 
@@ -258,12 +275,15 @@ SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
     }
 }
 
-int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
+int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled,
+                      const char* context)
 {
+    const char* label = context ? context : "unlabeled stage";
     if (frame == nullptr || enrolled == nullptr || frame->descriptors.empty() ||
         enrolled->descriptors.empty() ||
         frame->keypoints.size() != static_cast<std::size_t>(frame->descriptors.rows) ||
         enrolled->keypoints.size() != static_cast<std::size_t>(enrolled->descriptors.rows)) {
+        std::fprintf(stderr, "SIGFM match [%s]: invalid feature data\n", label);
         return 0;
     }
 
@@ -293,13 +313,14 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
         }
 
         if (candidate_indices.size() < min_match) {
+            std::fprintf(stderr, "SIGFM match [%s]: only %zu ratio candidates (need %d)\n",
+                         label, candidate_indices.size(), min_match);
             return 0;
         }
 
         std::vector<std::vector<cv::DMatch>> backward;
         bfm->knnMatch(candidate_descriptors, frame->descriptors, backward, 1);
         std::set<match> matches_unique;
-        int nb_matched = 0;
         for (const auto& pts : points) {
             if (pts.size() < 2) {
                 continue;
@@ -315,65 +336,189 @@ int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
                 matches_unique.emplace(
                     match{frame->keypoints.at(match_1.queryIdx).pt,
                           enrolled->keypoints.at(match_1.trainIdx).pt});
-                nb_matched++;
             }
-        }
-        if (nb_matched < min_match) {
-            return 0;
         }
         std::vector<match> matches{matches_unique.begin(),
                                    matches_unique.end()};
+        if (matches.size() < min_match) {
+            std::fprintf(stderr, "SIGFM match [%s]: reciprocal=%zu (need %d)\n",
+                         label, matches.size(), min_match);
+            return 0;
+        }
 
-        /* Compare pairwise displacement vectors instead of absolute points,
-         * so translation is ignored while scale and rotation remain bounded.
+        /* Compare pairwise displacement vectors instead of absolute points.
+         * Estimate one common scale for the press first: skin pressure changes
+         * apparent finger size, while random local scales do not fit one
+         * global transform.
          */
-        std::vector<angle> angles;
+        struct pair_geometry {
+            std::size_t first;
+            std::size_t second;
+            double scale;
+            double rotation;
+        };
+        std::vector<pair_geometry> pair_geometries;
         for (std::size_t j = 0; j < matches.size(); j++) {
-            match match_1 = matches[j];
             for (std::size_t k = j + 1; k < matches.size(); k++) {
-                match match_2 = matches[k];
-
-                const double x1 = match_1.p1.x - match_2.p1.x;
-                const double y1 = match_1.p1.y - match_2.p1.y;
-                const double x2 = match_1.p2.x - match_2.p2.x;
-                const double y2 = match_1.p2.y - match_2.p2.y;
-
+                const double x1 = matches[j].p1.x - matches[k].p1.x;
+                const double y1 = matches[j].p1.y - matches[k].p1.y;
+                const double x2 = matches[j].p2.x - matches[k].p2.x;
+                const double y2 = matches[j].p2.y - matches[k].p2.y;
                 const double length_1 = std::hypot(x1, y1);
                 const double length_2 = std::hypot(x2, y2);
 
                 if (length_1 < 3.0 || length_2 < 3.0)
                     continue;
 
-                if (1 - std::min(length_1, length_2) /
-                            std::max(length_1, length_2) <=
-                    length_match) {
-
-                    const double dot = x1 * x2 + y1 * y2;
-                    const double cross = x1 * y2 - y1 * x2;
-                    angles.emplace_back(std::atan2(cross, dot));
-                }
+                pair_geometries.push_back(
+                    {j, k, length_2 / length_1,
+                     std::atan2(x1 * y2 - y1 * x2, x1 * x2 + y1 * y2)});
             }
         }
 
-        if (angles.size() < min_match) {
+        if (pair_geometries.size() < static_cast<std::size_t>(min_match)) {
+            std::fprintf(stderr, "SIGFM match [%s]: usable vectors=%zu (need %d)\n",
+                         label, pair_geometries.size(), min_match);
             return 0;
         }
 
-        int count = 0;
-        for (std::size_t j = 0; j < angles.size(); j++) {
-            const angle& angle_1 = angles[j];
-            for (std::size_t k = j + 1; k < angles.size(); k++) {
-                const angle& angle_2 = angles[k];
-                const double delta = std::remainder(angle_1.radians - angle_2.radians,
-                                                    2.0 * M_PI);
-                if (std::abs(delta) <= angle_match) {
-                    count += 1;
-                }
+        std::vector<double> scale_ratios;
+        scale_ratios.reserve(pair_geometries.size());
+        for (const auto& geometry : pair_geometries)
+            scale_ratios.push_back(geometry.scale);
+        std::sort(scale_ratios.begin(), scale_ratios.end());
+        const double median_scale = scale_ratios[scale_ratios.size() / 2];
+        if (median_scale < min_pair_scale || median_scale > max_pair_scale) {
+            std::fprintf(stderr,
+                         "SIGFM match [%s]: implausible scale %.3f (allowed %.2f..%.2f)\n",
+                         label, median_scale, min_pair_scale, max_pair_scale);
+            return 0;
+        }
+
+        std::vector<pair_geometry> consistent_pairs;
+        for (const auto& geometry : pair_geometries) {
+            const double scale_similarity =
+                1.0 - std::min(geometry.scale, median_scale) /
+                          std::max(geometry.scale, median_scale);
+            if (scale_similarity <= length_match)
+                consistent_pairs.push_back(geometry);
+        }
+
+        if (consistent_pairs.size() < static_cast<std::size_t>(min_match)) {
+            std::fprintf(stderr,
+                         "SIGFM match [%s]: scale-consistent vectors=%zu (need %d)\n",
+                         label, consistent_pairs.size(), min_match);
+            return 0;
+        }
+
+        /* Find the dominant rotation and refine its centre from its inliers. */
+        double dominant_rotation = 0.0;
+        int rotation_support = 0;
+        for (const auto& candidate : consistent_pairs) {
+            int support = 0;
+            for (const auto& other : consistent_pairs) {
+                if (std::abs(std::remainder(candidate.rotation - other.rotation,
+                                            2.0 * M_PI)) <= angle_match)
+                    support++;
+            }
+            if (support > rotation_support) {
+                rotation_support = support;
+                dominant_rotation = candidate.rotation;
             }
         }
-        return count;
+
+        double sin_sum = 0.0;
+        double cos_sum = 0.0;
+        for (const auto& other : consistent_pairs) {
+            if (std::abs(std::remainder(other.rotation - dominant_rotation,
+                                        2.0 * M_PI)) <= angle_match) {
+                sin_sum += std::sin(other.rotation);
+                cos_sum += std::cos(other.rotation);
+            }
+        }
+        if (sin_sum != 0.0 || cos_sum != 0.0)
+            dominant_rotation = std::atan2(sin_sum, cos_sum);
+
+        std::vector<char> participates(matches.size(), 0);
+        rotation_support = 0;
+        for (const auto& pair : consistent_pairs) {
+            if (std::abs(std::remainder(pair.rotation - dominant_rotation,
+                                        2.0 * M_PI)) <= angle_match) {
+                participates[pair.first] = 1;
+                participates[pair.second] = 1;
+                rotation_support++;
+            }
+        }
+
+        if (rotation_support < min_match) {
+            std::fprintf(stderr,
+                         "SIGFM match [%s]: rotation support=%d (need %d)\n",
+                         label, rotation_support, min_match);
+            return 0;
+        }
+
+        /* Rotation and scale alone still leave translation free, and unrelated
+         * presses can coincidentally share a rotation cluster. Project every
+         * participating match through the common rotation and scale; genuine
+         * correspondences land on the same translation, while chance matches
+         * scatter. Count the largest translation cluster.
+         */
+        const double cos_theta = std::cos(dominant_rotation) * median_scale;
+        const double sin_theta = std::sin(dominant_rotation) * median_scale;
+        std::vector<cv::Point2f> translations;
+        for (std::size_t i = 0; i < matches.size(); i++) {
+            if (!participates[i])
+                continue;
+            const double rotated_x = cos_theta * matches[i].p1.x -
+                                     sin_theta * matches[i].p1.y;
+            const double rotated_y = sin_theta * matches[i].p1.x +
+                                     cos_theta * matches[i].p1.y;
+            translations.push_back(
+                {static_cast<float>(matches[i].p2.x - rotated_x),
+                 static_cast<float>(matches[i].p2.y - rotated_y)});
+        }
+
+        int translation_inliers = 0;
+        for (const auto& candidate : translations) {
+            int inliers = 0;
+            for (const auto& other : translations) {
+                if (std::hypot(candidate.x - other.x, candidate.y - other.y) <=
+                    translation_match)
+                    inliers++;
+            }
+            if (inliers > translation_inliers)
+                translation_inliers = inliers;
+        }
+
+        const double inlier_ratio =
+            static_cast<double>(translation_inliers) /
+            static_cast<double>(matches.size());
+        const bool accepted = translation_inliers >= min_translation_inliers &&
+                              inlier_ratio >= min_translation_ratio;
+
+        std::fprintf(stderr,
+                     "SIGFM match [%s]: matches=%zu scale=%.3f rotation-support=%d "
+                     "translation-inliers=%d/%zu ratio=%.3f accepted=%d "
+                     "rotation=%.1fdeg score=%d\n",
+                     label, matches.size(), median_scale, rotation_support,
+                     translation_inliers, matches.size(), inlier_ratio,
+                     accepted, dominant_rotation * 180.0 / M_PI,
+                     accepted ? translation_inliers : 0);
+
+        return accepted ? translation_inliers : 0;
+    }
+    catch (const cv::Exception& e) {
+        std::fprintf(stderr, "SIGFM match [%s]: OpenCV matching failed: %s\n",
+                     label, e.what());
+        return -1;
+    }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "SIGFM match [%s]: matching failed: %s\n",
+                     label, e.what());
+        return -1;
     }
     catch (...) {
+        std::fprintf(stderr, "SIGFM match [%s]: matching failed\n", label);
         return -1;
     }
 }
