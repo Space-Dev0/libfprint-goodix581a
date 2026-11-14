@@ -28,12 +28,13 @@
 /* SIGFM scores a stage by the number of matches that agree on one rotation,
  * scale and translation. A stage needs eight such inliers to count towards
  * consensus. Verification succeeds with one strongly supported stage or three
- * corroborating stages. On labelled 581a captures genuine presses scored up to
- * 27, while ten different-finger presses never exceeded seven; these cutoffs
- * therefore leave a margin without accepting a single chance cluster.
+ * corroborating stages. On labelled 581a captures with a 20-stage gallery,
+ * genuine presses scored 8-27 inliers while 21 different-finger presses never
+ * exceeded seven. A single stage therefore needs nine inliers: one above the
+ * best impostor cluster, and enough to recover the weakest genuine presses.
  */
 #define SIGFM_STAGE_MIN_INLIERS 8
-#define SIGFM_STRONG_INLIERS 10
+#define SIGFM_STRONG_INLIERS 9
 #define SIGFM_MIN_STAGES 3
 
 /* A new enrollment press scoring this well against an already stored stage is
