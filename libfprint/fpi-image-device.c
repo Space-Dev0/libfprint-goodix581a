@@ -28,13 +28,19 @@
 /* SIGFM scores a stage by the number of matches that agree on one rotation,
  * scale and translation. A stage needs eight such inliers to count towards
  * consensus. Verification succeeds with one strongly supported stage or three
- * corroborating stages. On labelled 581a captures genuine presses scored
- * 15-28, while wrong fingers never exceeded five; these cutoffs therefore
- * leave a wide margin without accepting a single chance cluster.
+ * corroborating stages. On labelled 581a captures genuine presses scored up to
+ * 27, while ten different-finger presses never exceeded seven; these cutoffs
+ * therefore leave a margin without accepting a single chance cluster.
  */
 #define SIGFM_STAGE_MIN_INLIERS 8
-#define SIGFM_STRONG_INLIERS 12
+#define SIGFM_STRONG_INLIERS 10
 #define SIGFM_MIN_STAGES 3
+
+/* A new enrollment press scoring this well against an already stored stage is
+ * almost certainly the same placement, so it adds nothing to gallery coverage.
+ * It is twice the best score any wrong finger reached in hardware testing.
+ */
+#define SIGFM_ENROLL_DUPLICATE_INLIERS 16
 
 /**
  * SECTION: fpi-image-device
@@ -496,6 +502,49 @@ fpi_image_device_report_finger_status (FpImageDevice *self,
  * including e.g. an enroll operation which captures multiple images during
  * one session.
  */
+/* Reject a press that is nearly identical to an already stored enrollment
+ * stage: it would only duplicate existing coverage. The threshold is well above
+ * what any wrong finger scored, so only repeated placements are discarded.
+ */
+static gboolean
+sigfm_enroll_stage_is_duplicate (SigfmImgInfo *info,
+                                 GPtrArray *enroll_features,
+                                 guint *matched_stage,
+                                 gint *matched_score)
+{
+  for (guint i = 0; i < enroll_features->len; i++)
+    {
+      GBytes *stage = g_ptr_array_index (enroll_features, i);
+      gsize stage_len = 0;
+      const guint8 *stage_data = g_bytes_get_data (stage, &stage_len);
+      SigfmImgInfo *previous = sigfm_deserialize_binary (
+        stage_data, stage_len <= G_MAXINT ? (gint) stage_len : 0);
+
+      if (!previous)
+        {
+          g_warning ("SIGFM enroll: could not decode stored stage %u for duplicate check",
+                     i + 1);
+          continue;
+        }
+
+      g_autofree gchar *stage_label = g_strdup_printf ("enroll duplicate stage %u", i + 1);
+      gint score = sigfm_match_score (info, previous, stage_label);
+      sigfm_free_info (previous);
+
+      g_message ("SIGFM enroll: candidate similarity to stage %u: %d",
+                 i + 1, score);
+
+      if (score >= SIGFM_ENROLL_DUPLICATE_INLIERS)
+        {
+          *matched_stage = i + 1;
+          *matched_score = score;
+          return TRUE;
+        }
+    }
+
+  return FALSE;
+}
+
 static void
 fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
 {
@@ -537,6 +586,22 @@ fpi_image_device_sigfm_process (FpImageDevice *self, FpImage *image)
 
       if (!priv->enroll_features)
         priv->enroll_features = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+
+      if (!error && info && priv->enroll_features->len > 0)
+        {
+          guint matched_stage = 0;
+          gint matched_score = 0;
+
+          if (sigfm_enroll_stage_is_duplicate (info, priv->enroll_features,
+                                               &matched_stage, &matched_score))
+            {
+              g_warning ("SIGFM enroll: rejecting near-duplicate press (stage %u, score=%d); requesting a new placement",
+                         matched_stage, matched_score);
+              error = fpi_device_retry_new_msg (
+                FP_DEVICE_RETRY_GENERAL,
+                "This press is too similar to an earlier one. Move your finger to cover a different area.");
+            }
+        }
 
       if (!error && info)
         {
