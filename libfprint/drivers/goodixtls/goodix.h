@@ -519,6 +519,21 @@ gboolean goodix_dev_deinit (FpDevice *dev,
  */
 void goodix_reset_state (FpDevice *dev);
 
+/**
+ * @brief Reset the USB device and re-claim its interface
+ *
+ * A rejected TLS handshake can leave the sensor in a state that survives the
+ * protocol reset command: every later handshake fails the same way until the
+ * sensor sees a USB port reset. This performs that reset and restores the
+ * interface claim so the driver can keep using the device.
+ *
+ * @param dev
+ * @param error
+ * @return gboolean TRUE if the device was reset and re-claimed
+ */
+gboolean goodix_usb_reset (FpDevice *dev,
+                           GError  **error);
+
 // ---- DEV SECTION END ----
 
 // -----------------------------------------------------------------------------

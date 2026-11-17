@@ -1196,6 +1196,35 @@ goodix_dev_deinit (FpDevice *dev, GError **error)
                                          class->interface, 0, error);
 }
 
+gboolean
+goodix_usb_reset (FpDevice *dev, GError **error)
+{
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+  FpiDeviceGoodixTlsClass *class = FPI_DEVICE_GOODIXTLS_GET_CLASS (self);
+  GUsbDevice *usb_dev = fpi_device_get_usb_device (dev);
+  GError *local_error = NULL;
+
+  /* The interface claim does not survive a port reset, so drop it first and
+   * claim it again afterwards.
+   */
+  g_usb_device_release_interface (usb_dev, class->interface, 0, NULL);
+
+  if (!g_usb_device_reset (usb_dev, &local_error))
+    {
+      g_propagate_error (error, local_error);
+      return FALSE;
+    }
+
+  if (!g_usb_device_claim_interface (usb_dev, class->interface, 0,
+                                     &local_error))
+    {
+      g_propagate_error (error, local_error);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
 // ---- DEV SECTION END ----
 
 // -----------------------------------------------------------------------------
