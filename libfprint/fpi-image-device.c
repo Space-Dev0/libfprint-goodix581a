@@ -18,6 +18,9 @@
  */
 
 #define FP_COMPONENT "image_device"
+
+#include <stdint.h>
+
 #include "fpi-log.h"
 
 #include "fp-image-device-private.h"
