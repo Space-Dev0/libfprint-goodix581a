@@ -27,6 +27,7 @@
 #include <glib.h>
 #include <gusb.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -1359,9 +1360,41 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
     }
   else if (stage == TLS_HANDSHAKE_STAGE_CHANGE_CIPHER_S)
     {
-      fp_dbg ("Reading to proxy back");
+      GError *err = NULL;
       guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
+      int size;
+
+      /* The device cannot be trusted to complete the handshake even though it
+       * sent every expected record: SSL_accept() may still reject its
+       * Finished. Wait for the server thread, otherwise a fatal alert would be
+       * forwarded and the activation would continue with a dead TLS session.
+       */
+      if (!goodix_tls_server_wait_handshake (priv->tls_hop, 3000, &err))
+        {
+          /* Forward the alert OpenSSL produced, if any, so the sensor sees the
+           * same termination a rejected handshake would normally cause.
+           */
+          struct pollfd pfd = {
+            .fd = priv->tls_hop->client_fd,
+            .events = POLLIN,
+          };
+
+          if (poll (&pfd, 1, 100) > 0)
+            {
+              GError *send_err = NULL;
+
+              size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
+              if (size > 0)
+                goodix_send_tls_records (dev, buff, size, &send_err);
+              g_clear_error (&send_err);
+            }
+
+          fpi_ssm_mark_failed (ssm, err);
+          return;
+        }
+
+      fp_dbg ("Reading to proxy back");
+      size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
       if (size < 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
@@ -1370,7 +1403,6 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
           return;
         }
-      GError *err = NULL;
       if (!goodix_send_tls_records (dev, buff, size, &err))
         {
           fpi_ssm_mark_failed (ssm, err);
@@ -1396,7 +1428,7 @@ on_goodix_request_tls_connection (FpDevice *dev, guint8 *data,
   if (error)
     {
       fp_err ("failed to get tls handshake: %s", error->message);
-      goodix_send_tls_successfully_established (FP_DEVICE (dev), NULL, NULL);
+      on_tls_successfully_established (dev, NULL, error);
       return;
     }
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (user_data);
@@ -1415,6 +1447,7 @@ goodix_tls_ready (GoodixTlsServer *server, GError *err, gpointer dev)
     {
       fp_err ("failed to init tls server: %s, code: %d", err->message,
               err->code);
+      on_tls_successfully_established (dev, NULL, err);
       return;
     }
   goodix_send_request_tls_connection (FP_DEVICE (dev),
@@ -1429,7 +1462,7 @@ goodix_tls_init (FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
   g_assert (priv->tls_hop == NULL);
-  priv->tls_hop = malloc (sizeof (GoodixTlsServer));
+  priv->tls_hop = g_new0 (GoodixTlsServer, 1);
 
   if (!priv->tls_ready_callback)
     priv->tls_ready_callback = malloc (sizeof (GoodixCallbackInfo));
@@ -1440,8 +1473,7 @@ goodix_tls_init (FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
   GError *err = NULL;
   if (!goodix_tls_server_init (priv->tls_hop, &err))
     {
-      fp_err ("failed to init tls server, error: %s, code: %d", err->message,
-              err->code);
+      goodix_tls_ready (s, err, self);
       return;
     }
 

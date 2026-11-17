@@ -211,10 +211,48 @@ goodix_tls_init_serve (void *me)
       char err_buf[256] = {0};
       ERR_error_string_n (e, err_buf, sizeof (err_buf));
       fp_err ("server ready failed (retr=%d, ssl_err=%d): %s", retr, ssl_err, err_buf);
+
+      g_strlcpy (self->handshake_error, err_buf, sizeof (self->handshake_error));
+      g_atomic_int_set (&self->handshake_state, -1);
     }
   else
-    fp_dbg ("TLS connection ready");
+    {
+      fp_dbg ("TLS connection ready");
+      g_atomic_int_set (&self->handshake_state, 1);
+    }
   return NULL;
+}
+
+gboolean
+goodix_tls_server_wait_handshake (GoodixTlsServer *self, guint timeout_ms,
+                                  GError **error)
+{
+  guint waited_ms = 0;
+
+  while (g_atomic_int_get (&self->handshake_state) == 0 &&
+         waited_ms < timeout_ms)
+    {
+      g_usleep (10 * 1000);
+      waited_ms += 10;
+    }
+
+  switch (g_atomic_int_get (&self->handshake_state))
+    {
+    case 1:
+      return TRUE;
+
+    case -1:
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "sensor rejected the TLS handshake (%s)",
+                   self->handshake_error[0] ? self->handshake_error
+                                            : "no OpenSSL detail");
+      return FALSE;
+
+    default:
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                   "TLS handshake did not finish within %u ms", timeout_ms);
+      return FALSE;
+    }
 }
 
 gboolean
@@ -233,7 +271,11 @@ goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
       self->client_fd = -1;
     }
 
-  pthread_join (self->serve_thread, NULL);
+  if (self->serve_thread_started)
+    {
+      pthread_join (self->serve_thread, NULL);
+      self->serve_thread_started = FALSE;
+    }
 
   if (self->ssl_layer)
     {
@@ -254,6 +296,11 @@ goodix_tls_server_deinit (GoodixTlsServer *self, GError **error)
 gboolean
 goodix_tls_server_init (GoodixTlsServer *self, GError **error)
 {
+  self->sock_fd = -1;
+  self->client_fd = -1;
+  g_atomic_int_set (&self->handshake_state, 0);
+  self->handshake_error[0] = '\0';
+
   SSL_load_error_strings ();
   OpenSSL_add_ssl_algorithms ();
   SSL_library_init ();
@@ -283,7 +330,14 @@ goodix_tls_server_init (GoodixTlsServer *self, GError **error)
   tls_config_ssl (self->ssl_layer);
   SSL_set_fd (self->ssl_layer, self->sock_fd);
 
-  pthread_create (&self->serve_thread, 0, goodix_tls_init_serve, self);
+  self->serve_thread_started = TRUE;
+  if (pthread_create (&self->serve_thread, 0, goodix_tls_init_serve, self) != 0)
+    {
+      self->serve_thread_started = FALSE;
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "failed to start the TLS server thread");
+      return FALSE;
+    }
 
   return TRUE;
 }

@@ -44,6 +44,14 @@ typedef struct _GoodixTlsServer
   int       client_fd;
 
   pthread_t serve_thread;
+  gboolean  serve_thread_started;
+
+  /* Result of the handshake started by goodix_tls_server_init(), written by
+   * the serve thread: 0 while SSL_accept() is running, 1 once it completed
+   * and -1 when it failed. Read with g_atomic_int_get().
+   */
+  gint      handshake_state;
+  gchar     handshake_error[256];
 } GoodixTlsServer;
 
 /**
@@ -55,6 +63,18 @@ typedef struct _GoodixTlsServer
  */
 gboolean goodix_tls_server_init (GoodixTlsServer *self,
                                  GError         **error);
+
+/**
+ * @brief Wait for the TLS handshake started by goodix_tls_server_init()
+ *
+ * @param self server context
+ * @param timeout_ms how long to wait for SSL_accept() to finish
+ * @param error set when the handshake failed or did not finish in time
+ * @return gboolean TRUE when the handshake completed
+ */
+gboolean goodix_tls_server_wait_handshake (GoodixTlsServer *self,
+                                           guint            timeout_ms,
+                                           GError         **error);
 
 /**
  * @brief Read a message from the server side of the TLS connection.
