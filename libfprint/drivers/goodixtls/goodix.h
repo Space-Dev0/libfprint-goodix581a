@@ -475,6 +475,27 @@ void goodix_send_preset_psk_read (FpDevice                   *dev,
                                   guint16                     length,
                                   GoodixPresetPskReadCallback callback,
                                   gpointer                    user_data);
+
+/**
+ * @brief Read the preset PSK using the GM168 16-byte request body
+ *
+ * GM168SEC firmware expects length, offset, tag and a reserved word as four
+ * little-endian 32-bit fields, which the legacy helper above does not send.
+ * The read also brings the sensor's TLS key state back in sync after a failed
+ * handshake; without it a sensor left in that state rejects every later
+ * handshake until it is power-cycled.
+ *
+ * @param dev
+ * @param flags tag selecting the key field, 0xbb020001 for SHA256(PSK)
+ * @param length number of bytes to read
+ * @param callback
+ * @param user_data
+ */
+void goodix_send_gm168_preset_psk_read (FpDevice                   *dev,
+                                        guint32                     flags,
+                                        guint32                     length,
+                                        GoodixPresetPskReadCallback callback,
+                                        gpointer                    user_data);
 /**
  * @brief Request the OTP (One Time Password) from the device
  *

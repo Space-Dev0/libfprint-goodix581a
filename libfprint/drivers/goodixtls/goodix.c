@@ -1134,6 +1134,36 @@ goodix_send_preset_psk_read (FpDevice *dev, guint32 flags, guint16 length,
                         NULL);
 }
 
+/* GM168SEC uses a 16-byte 0xE4 request body in this order:
+ * length, offset, tag, reserved (all uint32 little-endian). The legacy
+ * Goodix 5xx helper above sends a different 8-byte body and is not compatible.
+ */
+void
+goodix_send_gm168_preset_psk_read (FpDevice *dev, guint32 flags,
+                                  guint32 length,
+                                  GoodixPresetPskReadCallback callback,
+                                  gpointer user_data)
+{
+  guint8 payload[4 * sizeof (guint32)] = {0};
+  guint32 field;
+  GoodixCallbackInfo *cb_info;
+
+  g_return_if_fail (callback != NULL);
+
+  field = GUINT32_TO_LE (length);
+  memcpy (payload, &field, sizeof (field));
+  field = GUINT32_TO_LE (flags);
+  memcpy (payload + 2 * sizeof (field), &field, sizeof (field));
+
+  cb_info = g_new0 (GoodixCallbackInfo, 1);
+  cb_info->callback = G_CALLBACK (callback);
+  cb_info->user_data = user_data;
+
+  goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_READ, payload,
+                        sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                        goodix_receive_preset_psk_read, cb_info);
+}
+
 // ---- GOODIX SEND SECTION END ----
 
 // -----------------------------------------------------------------------------
